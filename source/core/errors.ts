@@ -1,5 +1,6 @@
 import is from '@sindresorhus/is';
 import stripUrlAuth from './utils/strip-url-auth.js';
+import type {StandardSchemaV1Issue} from './standard-schema.js';
 import type {Timings} from './utils/timer.js';
 import type Options from './options.js';
 import type {TimeoutError as TimedOutTimeoutError} from './timed-out.js';
@@ -98,7 +99,16 @@ export class RequestError<T = unknown> extends Error {
 			// by dropping everything before this point. A multi-line message spans several lines,
 			// so the whole message is the boundary. A message that is empty or absent matches at
 			// zero and would leave the header in the frames, so the first newline is the boundary.
-			const frameStart = (stack: string, message: string | undefined): number => (message ? stack.indexOf(message) + message.length : stack.indexOf('\n'));
+			// A message that is not in its stack, such as one changed after the stack was read, has no
+			// boundary at all.
+			const frameStart = (stack: string, message: string | undefined): number => {
+				if (!message) {
+					return stack.indexOf('\n');
+				}
+
+				const messageStart = stack.indexOf(message);
+				return messageStart === -1 ? -1 : messageStart + message.length;
+			};
 
 			const headerEnd = frameStart(this.stack, this.message);
 			const thisStackTrace = (headerEnd === -1 ? '' : this.stack.slice(headerEnd)).split('\n').toReversed();
@@ -168,11 +178,11 @@ For example, if the database goes down or there's a filesystem error.
 */
 export class CacheError extends RequestError {
 	override name = 'CacheError';
+	override code = 'ERR_CACHE_ACCESS';
 	declare readonly request: Request;
 
 	constructor(error: Error, request: Request) {
 		super(error.message, error, request);
-		this.code = 'ERR_CACHE_ACCESS';
 	}
 }
 
@@ -181,11 +191,11 @@ An error to be thrown when the request body is a stream and an error occurs whil
 */
 export class UploadError extends RequestError {
 	override name = 'UploadError';
+	override code = 'ERR_UPLOAD';
 	declare readonly request: Request;
 
 	constructor(error: Error, request: Request) {
 		super(error.message, error, request);
-		this.code = 'ERR_UPLOAD';
 	}
 }
 
@@ -250,5 +260,39 @@ export class AbortError extends RequestError {
 		if (request.options?.signal?.aborted) {
 			this.cause = request.options.signal.reason;
 		}
+	}
+}
+
+/**
+An error to be thrown when the response body does not match the [Standard Schema](https://standardschema.dev) validator passed to `.json(schema)`. Includes an `issues` property with the issues from the schema. Each issue has a `message` and an optional `path`.
+
+It intentionally does not extend `RequestError`, because the request succeeded. The user-provided schema did not accept the data, so it has no `code`, `options`, `request`, `response` or `timings` property, and it is not passed to `beforeError` hooks.
+
+@example
+```
+import got, {SchemaValidationError} from 'got';
+import {z} from 'zod';
+
+const userSchema = z.object({name: z.string()});
+
+try {
+	const user = await got('https://example.com/user').json(userSchema);
+	console.log(user.name);
+} catch (error) {
+	if (error instanceof SchemaValidationError) {
+		console.error(error.issues);
+	} else {
+		throw error;
+	}
+}
+```
+*/
+export class SchemaValidationError extends Error {
+	override name = 'SchemaValidationError';
+	readonly issues: readonly StandardSchemaV1Issue[];
+
+	constructor(issues: readonly StandardSchemaV1Issue[]) {
+		super('Response schema validation failed');
+		this.issues = issues;
 	}
 }

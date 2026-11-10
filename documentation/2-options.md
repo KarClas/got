@@ -188,7 +188,7 @@ console.log(searchParams.toString());
 
 The string to be prepended to relative string `url` input.
 
-The prefix must be an [absolute URL](https://url.spec.whatwg.org/#absolute-url-string), since Got has no base to resolve it against.
+The prefix must be an [absolute URL](https://url.spec.whatwg.org/#absolute-url-string), since Got has no base to resolve it against. It must not contain a query string or a fragment.
 A trailing slash `/` is optional - one will be added automatically.
 
 ```js
@@ -293,10 +293,10 @@ console.log(method);
 
 ### `headers`
 
-**Type: `object<string, string>`**\
+**Type: `object<string, string | string[] | number>`**\
 **Default: `{'user-agent': 'got (https://github.com/sindresorhus/got)'}`**
 
-The [HTTP headers](https://datatracker.ietf.org/doc/html/rfc7231#section-8.3) to be sent. Headers set to `undefined` will be omitted.
+The [HTTP headers](https://datatracker.ietf.org/doc/html/rfc7231#section-8.3) to be sent. Headers set to `undefined` will be omitted. Number values are stored and sent as strings.
 
 ```js
 import got from 'got';
@@ -465,11 +465,11 @@ The function used to parse JSON responses.
 
 ```js
 import got from 'got';
-import Bourne from '@hapi/bourne';
+import {parse} from '@hapi/bourne';
 
 // Preventing prototype pollution by using Bourne
 const parsed = await got('https://example.com', {
-	parseJson: text => Bourne.parse(text)
+	parseJson: text => parse(text)
 }).json();
 
 console.log(parsed);
@@ -657,6 +657,8 @@ The parsing method.
 
 The promise also has `.text()`, `.json()` and `.buffer()` methods which return another Got promise for the parsed body.\
 It's like setting the options to `{responseType: 'json', resolveBodyOnly: true}` but without affecting the main Got promise.
+
+`.json()` also accepts a [Standard Schema](https://standardschema.dev) validator, in which case the promise resolves with the output of the schema. See [`promise.json(schema)`](1-promise.md#promisejsonschema).
 
 ```js
 import got from 'got';

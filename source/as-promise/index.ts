@@ -4,9 +4,11 @@ import {
 	normalizeError,
 	HTTPError,
 	RetryError,
+	SchemaValidationError,
 	type RequestError,
 } from '../core/errors.js';
 import Request from '../core/index.js';
+import type {StandardSchemaV1} from '../core/standard-schema.js';
 import isNonReplayableBody from '../core/utils/is-non-replayable-body.js';
 import {
 	decodeUint8Array,
@@ -19,6 +21,7 @@ import proxyEvents from '../core/utils/proxy-events.js';
 import {
 	assertUrlHasSameOriginAsPrefixUrlIfNeeded,
 	getUrlPrefixBoundary,
+	hasBodyOptionChanged,
 	hasUrlOrPrefixUrlBoundaryChanged,
 	isSameOrigin,
 	snapshotCrossOriginState,
@@ -34,6 +37,23 @@ const proxiedRequestEvents = [
 	'uploadProgress',
 	'downloadProgress',
 ];
+
+const validateWithSchema = async (value: unknown, schema: StandardSchemaV1): Promise<unknown> => {
+	// JavaScript users can pass anything, so check the shape before calling into the schema.
+	const standardSchema = is.object(schema) ? schema['~standard'] : undefined;
+
+	if (!is.object(standardSchema) || typeof standardSchema.validate !== 'function') {
+		throw new TypeError('The `schema` argument must follow the Standard Schema specification');
+	}
+
+	const validationResult = await standardSchema.validate(value);
+
+	if (validationResult.issues) {
+		throw new SchemaValidationError(validationResult.issues);
+	}
+
+	return validationResult.value;
+};
 
 export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> {
 	let globalRequest: Request;
@@ -54,9 +74,12 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 				response.ok = isResponseOk(response);
 			};
 
-			// The `response` event carries the response the promise settles with, not the
-			// response of an attempt that is about to be retried or thrown.
-			const emitResponse = (response: Response): void => {
+			// Settles the promise and emits `response`. The event carries the response the promise settles
+			// with, not the response of an attempt that is about to be retried or thrown.
+			const resolveWithResponse = (response: Response): void => {
+				request.destroy();
+				promiseSettled = true;
+
 				// The listener runs outside any request error handling, so a throw would otherwise
 				// escape as an unhandled error and leave the promise pending. The later `resolve()` is
 				// then a no-op.
@@ -65,6 +88,9 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 				} catch (error) {
 					reject(normalizeError(error));
 				}
+
+				// eslint-disable-next-line unicorn/no-multiple-promise-resolver-calls
+				resolve(request.options.resolveBodyOnly ? response.body as T : response as unknown as T);
 			};
 
 			request.once('response', (response: Response) => {
@@ -112,10 +138,9 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 							// eslint-disable-next-line no-await-in-loop
 							response = await requestOptions.trackStateMutations(async changedState => hook(responseSnapshot, async (updatedOptions): RequestPromise<Response> => {
 								const preserveHooks = updatedOptions.preserveHooks ?? false;
-								const reusesRequestOptions = updatedOptions === requestOptions;
 
-								if (reusesRequestOptions) {
-									const hasExplicitBody = changedState.has('body') || changedState.has('json') || changedState.has('form');
+								if (updatedOptions === requestOptions) {
+									const hasExplicitBody = hasBodyOptionChanged(changedState);
 
 									options.clearUnchangedCookieHeader(previousState, changedState);
 
@@ -128,12 +153,12 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 										assertUrlHasSameOriginAsPrefixUrlIfNeeded(options, currentUrl);
 									}
 
-									if (updatedOptions.url !== undefined) {
-										const nextUrl = currentUrl as URL;
-
-										if (previousUrl && !isSameOrigin(previousUrl, nextUrl)) {
-											options.stripUnchangedCrossOriginState(previousState!, changedState, {clearBody: !hasExplicitBody});
-										}
+									if (
+										updatedOptions.url !== undefined
+										&& previousUrl
+										&& !isSameOrigin(previousUrl, currentUrl as URL)
+									) {
+										options.stripUnchangedCrossOriginState(previousState!, changedState, {clearBody: !hasExplicitBody});
 									}
 								} else {
 									options.mergeNextRequestOptions(updatedOptions, {
@@ -168,10 +193,7 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 						return;
 					}
 
-					request.destroy();
-					promiseSettled = true;
-					emitResponse(response);
-					resolve(request.options.resolveBodyOnly ? response.body as T : response as unknown as T);
+					resolveWithResponse(response);
 				})();
 			});
 
@@ -194,15 +216,10 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 				handledFinalError = true;
 
 				promiseSettled = true;
-				const {options} = request;
 
-				if (error instanceof HTTPError && !options.throwHttpErrors) {
-					const {response} = error;
-					setResponse(response);
-
-					request.destroy();
-					emitResponse(response);
-					resolve(options.resolveBodyOnly ? response.body as T : response as unknown as T);
+				if (error instanceof HTTPError && !request.options.throwHttpErrors) {
+					setResponse(error.response);
+					resolveWithResponse(error.response);
 					return;
 				}
 
@@ -256,22 +273,14 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 		makeRequest(0);
 	}) as RequestPromise<T>;
 
-	promise.on = function (this: RequestPromise<T>, event: string, function_: (...arguments_: any[]) => void) {
-		emitter.on(event, function_);
-		return this;
-	};
+	for (const method of ['on', 'once', 'off'] as const) {
+		promise[method] = function (this: RequestPromise<T>, event: string, function_: (...arguments_: any[]) => void) {
+			emitter[method](event, function_);
+			return this;
+		};
+	}
 
-	promise.once = function (this: RequestPromise<T>, event: string, function_: (...arguments_: any[]) => void) {
-		emitter.once(event, function_);
-		return this;
-	};
-
-	promise.off = function (this: RequestPromise<T>, event: string, function_: (...arguments_: any[]) => void) {
-		emitter.off(event, function_);
-		return this;
-	};
-
-	const shortcut = <T>(promiseToAwait: RequestPromise, responseType: Options['responseType']): RequestPromise<T> => {
+	const shortcut = <T>(promiseToAwait: RequestPromise, responseType: Options['responseType'], schema?: StandardSchemaV1): RequestPromise<T> => {
 		const newPromise = (async () => {
 			// Wait until downloading has ended
 			const response = await promiseToAwait as Response | undefined;
@@ -285,7 +294,17 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 
 			// `parseBody` wraps a decode failure in a `ParseError`, so an unusable encoding is
 			// reported with the response attached instead of as a bare `TypeError`.
-			return parseBody(globalResponse, responseType, options.parseJson, options.encoding) as T;
+			const body = parseBody(globalResponse, responseType, options.parseJson, options.encoding);
+
+			if (schema === undefined) {
+				return body as T;
+			}
+
+			// Awaiting instead of returning the validation promise keeps the caller's frame in the
+			// async stack trace of a `SchemaValidationError`.
+			const validatedBody = await validateWithSchema(body, schema);
+
+			return validatedBody as T;
 		})();
 
 		// eslint-disable-next-line @typescript-eslint/no-floating-promises
@@ -298,7 +317,7 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 	// When custom handlers wrap the promise to transform errors, these methods
 	// are copied to the handler's promise. Using `this` ensures we await the
 	// handler's wrapped promise, not the original, so errors propagate correctly.
-	promise.json = function (this: RequestPromise) {
+	promise.json = function (this: RequestPromise, schema?: StandardSchemaV1) {
 		if (globalRequest.options) {
 			const {headers} = globalRequest.options;
 
@@ -307,7 +326,7 @@ export default function asPromise<T>(firstRequest?: Request): RequestPromise<T> 
 			}
 		}
 
-		return shortcut(this, 'json');
+		return shortcut(this, 'json', schema);
 	};
 
 	promise.buffer = function (this: RequestPromise) {

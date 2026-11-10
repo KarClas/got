@@ -2,32 +2,39 @@ import process from 'node:process';
 import {Buffer} from 'node:buffer';
 import {gzipSync} from 'node:zlib';
 import fs from 'node:fs';
-import {
+import http, {
 	Agent as HttpAgent,
 	IncomingMessage,
 	ServerResponse,
 	request as httpRequest,
 	type ClientRequest,
 } from 'node:http';
+import http2 from 'node:http2';
+import type net from 'node:net';
 import {Socket} from 'node:net';
 import stream, {Readable as ReadableStream, Writable} from 'node:stream';
 import {pipeline as streamPipeline} from 'node:stream/promises';
 import assert from 'node:assert/strict';
 import {once} from 'node:events';
+import {promisify} from 'node:util';
 import type {Handler} from 'express';
 import getStream from 'get-stream';
 import {Readable as Readable2} from 'readable-stream';
 import is from '@sindresorhus/is';
 import delay from 'delay';
+import pem from 'pem';
 import * as toughCookie from 'tough-cookie';
 import {expectTypeOf} from 'expect-type';
 import got, {HTTPError, RequestError, type Options} from '../source/index.js';
-import type {Response} from '../source/core/response.js';
+import type {PlainResponse, Response} from '../source/core/response.js';
 import {rejects} from './helpers/rejects.js';
 import {errorMatching} from './helpers/error-matching.js';
 import {onceValue} from './helpers/once-value.js';
 import test from './helpers/test.js';
 import withServer from './helpers/with-server.js';
+import type {CreateCertificate} from './types/pem.js';
+
+const createCertificate = promisify(pem.createCertificate as CreateCertificate);
 
 const defaultHandler: Handler = (_request, response) => {
 	response.writeHead(200, {
@@ -246,7 +253,7 @@ test('redirect event passes the updated options first and the response second', 
 	const request = got('redirect').on('redirect', (updatedOptions, response) => {
 		redirectCount += 1;
 		expectTypeOf(updatedOptions).toEqualTypeOf<Options>();
-		expectTypeOf(response).toEqualTypeOf<Response>();
+		expectTypeOf(response).toEqualTypeOf<PlainResponse>();
 		assert.strictEqual(new URL(updatedOptions.url!).pathname, '/');
 		assert.strictEqual(response.statusCode, 302);
 	});
@@ -1989,4 +1996,250 @@ test('a piped ServerResponse is closed when a retry listener throws', withServer
 	// The proxy client is released instead of waiting for a body that never arrives.
 	const error = await rejects(got('proxy'));
 	assert.strictEqual(error.code, 'ECONNRESET');
+});
+
+// The HTTP/2 compatibility layer hands out `Http2ServerResponse`, which Got owns just like an
+// HTTP/1 `ServerResponse` once it pipes into it: a failed upstream must not leave the client
+// waiting forever.
+test('closes a piped HTTP/2 ServerResponse when the upstream request fails', async t => {
+	const upstream = http.createServer((_request, response) => {
+		response.writeHead(200, {'content-length': 100});
+		response.write('abc');
+		setTimeout(() => {
+			response.destroy();
+		}, 20);
+	});
+	await new Promise<void>(resolve => {
+		upstream.listen(0, '127.0.0.1', resolve);
+	});
+	const {port: upstreamPort} = upstream.address() as net.AddressInfo;
+	t.after(async () => {
+		await new Promise<void>(resolve => {
+			upstream.close(() => {
+				resolve();
+			});
+		});
+	});
+
+	const certificate = await createCertificate({days: 1, selfSigned: true});
+	const server = http2.createSecureServer({
+		key: certificate.serviceKey,
+		cert: certificate.certificate,
+		rejectUnauthorized: false,
+	}, (_request, response) => {
+		const stream = got.stream(`http://127.0.0.1:${upstreamPort}/`, {retry: {limit: 0}});
+		stream.pipe(response);
+		stream.on('error', () => {});
+	});
+	await new Promise<void>(resolve => {
+		server.listen(0, '127.0.0.1', resolve);
+	});
+	const {port} = server.address() as net.AddressInfo;
+
+	// Cleanups run in registration order, and the server only closes once the session is gone.
+	const session = http2.connect(`https://127.0.0.1:${port}`, {rejectUnauthorized: false});
+	t.after(() => {
+		session.destroy();
+	});
+	t.after(async () => {
+		await new Promise<void>(resolve => {
+			server.close(() => {
+				resolve();
+			});
+		});
+	});
+
+	const request = session.request({':path': '/'});
+	const settled = new Promise<string>(resolve => {
+		request.on('data', () => {});
+		request.on('close', () => {
+			resolve('closed');
+		});
+		request.on('error', (error: Error) => {
+			resolve(error.message);
+		});
+	});
+
+	const timeout = delay(2000).then(() => 'hang');
+	const outcome = await Promise.race([settled, timeout]);
+	// A clean close would tell the client the truncated body was complete.
+	assert.match(outcome, /NGHTTP2_INTERNAL_ERROR/v);
+});
+
+// A stream with a `body`, `json` or `form` option is read-only: Got dispatches that payload
+// itself, and a user write would land past the framed `content-length` and corrupt the request.
+test('writing to a read-only stream fails instead of corrupting the request', withServer, async (_t, server, got) => {
+	server.post('/', (request, response) => {
+		request.resume();
+		request.on('end', () => {
+			response.end('ok');
+		});
+	});
+
+	const stream = got.stream.post('', {json: {a: 1}});
+	const error = await new Promise<Error>(resolve => {
+		stream.once('error', resolve);
+		stream.write('extra');
+	});
+
+	assert.match(error.message, /read-only/v);
+});
+
+test('a read-only stream rejects writes buffered behind cork', withServer, async (_t, server, got) => {
+	server.post('/', (request, response) => {
+		request.resume();
+		request.on('end', () => {
+			response.end('ok');
+		});
+	});
+
+	const stream = got.stream.post('', {json: {a: 1}});
+	const error = await new Promise<Error>(resolve => {
+		stream.once('error', resolve);
+		stream.cork();
+		stream.write('buffered');
+		stream.uncork();
+	});
+
+	assert.match(error.message, /read-only/v);
+});
+
+test('a refused write to a read-only stream still calls its callback', withServer, async (_t, server, got) => {
+	server.post('/', (request, response) => {
+		request.resume();
+		request.on('end', () => {
+			response.end('ok');
+		});
+	});
+
+	const stream = got.stream.post('', {json: {a: 1}});
+	stream.on('error', () => {});
+	const error = await new Promise<Error | undefined>(resolve => {
+		stream.write('extra', error => {
+			resolve(error ?? undefined);
+		});
+	});
+
+	assert.match(error?.message ?? '', /read-only/v);
+});
+
+const nonUtf8ErrorBody = Buffer.from([0xFF, 0x00, 0xE9, 0x41]);
+
+const nonUtf8ErrorEndpoint: Handler = (_request, response) => {
+	response.statusCode = 500;
+	response.end(nonUtf8ErrorBody);
+};
+
+test('promise HTTP errors keep non-UTF-8 response bytes in `rawBody`', withServer, async (_t, server, got) => {
+	server.get('/', nonUtf8ErrorEndpoint);
+
+	const error = await rejects<HTTPError>(got('', {retry: {limit: 0}}), {name: 'HTTPError'});
+
+	assert.deepStrictEqual(error.response.rawBody, new Uint8Array(nonUtf8ErrorBody));
+});
+
+test('stream HTTP errors keep non-UTF-8 response bytes in `rawBody`', withServer, async (_t, server, got) => {
+	server.get('/', nonUtf8ErrorEndpoint);
+
+	const error = await rejects<HTTPError>(got.stream('', {retry: {limit: 0}}).toArray(), {name: 'HTTPError'});
+
+	assert.deepStrictEqual(error.response.rawBody, new Uint8Array(nonUtf8ErrorBody));
+});
+
+test('stream HTTP errors decode the response body with the `encoding` option', withServer, async (_t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 500;
+		response.end(Buffer.from('café', 'latin1'));
+	});
+
+	const error = await rejects<HTTPError>(got.stream('', {retry: {limit: 0}, encoding: 'latin1'}).toArray(), {name: 'HTTPError'});
+
+	assert.strictEqual(error.response.body, 'café');
+});
+
+test('stream HTTP errors keep compressed bytes in `rawBody` when decompression is disabled', withServer, async (_t, server, got) => {
+	const compressed = gzipSync('compressed error body');
+	server.get('/', (_request, response) => {
+		response.statusCode = 500;
+		response.setHeader('content-encoding', 'gzip');
+		response.end(compressed);
+	});
+
+	const error = await rejects<HTTPError>(got.stream('', {retry: {limit: 0}, decompress: false}).toArray(), {name: 'HTTPError'});
+
+	assert.deepStrictEqual(error.response.rawBody, new Uint8Array(compressed));
+});
+
+for (const encoding of ['hex', 'utf8'] as const) {
+	test(`stream HTTP errors capture the exact bytes when the stream has the \`${encoding}\` encoding`, withServer, async (_t, server, got) => {
+		server.get('/', nonUtf8ErrorEndpoint);
+
+		const stream = got.stream('', {retry: {limit: 0}});
+		stream.setEncoding(encoding);
+
+		const error = await rejects<HTTPError>(stream.toArray(), {name: 'HTTPError'});
+
+		assert.deepStrictEqual(error.response.rawBody, new Uint8Array(nonUtf8ErrorBody));
+	});
+}
+
+test('stream emits `request`, `response`, data, the final `downloadProgress` and `end` in order', withServer, async (_t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.setHeader('content-length', 10);
+		response.write('hello');
+		setTimeout(() => {
+			response.end('world');
+		}, 10);
+	});
+
+	const events: string[] = [];
+	const stream = got.stream('');
+	stream.on('request', () => {
+		events.push('request');
+	});
+	stream.on('response', () => {
+		events.push('response');
+	});
+	stream.on('downloadProgress', progress => {
+		events.push(`progress:${progress.transferred}/${progress.total}`);
+	});
+	stream.on('data', () => {
+		events.push('data');
+	});
+
+	await once(stream, 'end');
+
+	assert.strictEqual(events.indexOf('request') < events.indexOf('response'), true);
+	assert.strictEqual(events.indexOf('response') < events.indexOf('data'), true);
+	assert.strictEqual(events.at(-1), 'progress:10/10');
+	assert.strictEqual(events.lastIndexOf('data') < events.indexOf('progress:10/10'), true);
+	assert.strictEqual(events.filter(event => event === 'progress:10/10').length, 1);
+});
+
+test('`setEncoding` on a stream applies to the decompressed bytes', withServer, async (_t, server, got) => {
+	const payload = Buffer.from('café 🦄');
+	server.get('/', (_request, response) => {
+		response.setHeader('content-encoding', 'gzip');
+		response.end(gzipSync(payload));
+	});
+
+	const chunks = await got.stream('').setEncoding('hex').toArray();
+
+	assert.strictEqual(chunks.join(''), payload.toString('hex'));
+});
+
+test('stream with decompression disabled emits the compressed bytes and keeps `content-encoding`', withServer, async (_t, server, got) => {
+	const compressed = gzipSync('compressed body');
+	server.get('/', (_request, response) => {
+		response.setHeader('content-encoding', 'gzip');
+		response.end(compressed);
+	});
+
+	const stream = got.stream('', {decompress: false});
+	const responsePromise = once(stream, 'response');
+	const chunks = await stream.toArray();
+	const [response] = await responsePromise as [PlainResponse];
+
+	assert.deepStrictEqual(Buffer.concat(chunks), compressed);
+	assert.strictEqual(response.headers['content-encoding'], 'gzip');
 });

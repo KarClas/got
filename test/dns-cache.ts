@@ -490,7 +490,20 @@ test.serial('DNS cache applies ADDRCONFIG before V4MAPPED filtering', async _t =
 
 test.serial('DNS cache filters ADDRCONFIG lookups', async _t => {
 	const originalNetworkInterfaces = os.networkInterfaces;
+	// The internal IPv6 interface must not count as a configured IPv6 address.
 	os.networkInterfaces = () => ({
+		lo0: [
+			{
+				address: '::1',
+				netmask: 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+				family: 'IPv6',
+				mac: '00:00:00:00:00:00',
+				internal: true,
+				cidr: '::1/128',
+				scopeid: 0,
+			},
+		],
+		missing: undefined,
 		en0: [
 			{
 				address: '192.168.0.1',
@@ -1961,4 +1974,25 @@ test('DNS cache fallback reports the family of a single-result address', async _
 	});
 
 	assert.deepStrictEqual(await cache.lookupAsync('example.com', {family: 6}), {address: '::1', family: 6});
+});
+
+test('DNS cache surfaces the resolver error when both families reject', async _t => {
+	const cache = new DnsCache({
+		resolver: createResolver({
+			async resolve4() {
+				throw createDnsError('ESERVFAIL');
+			},
+			async resolve6() {
+				throw createDnsError('E_REFUSED');
+			},
+		}),
+	});
+
+	const error = await cache.lookupAsync('example.com')
+		.then(() => undefined)
+		.catch((error: unknown): NodeJS.ErrnoException => error as NodeJS.ErrnoException);
+
+	// Without a family filter both lookups run; a non-empty-result error must surface instead
+	// of silently turning into an empty result.
+	assert.strictEqual(error?.code, 'ESERVFAIL');
 });

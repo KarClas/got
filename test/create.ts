@@ -138,7 +138,7 @@ test('no tampering with defaults', _t => {
 
 test('mutable defaults keep a writable searchParams', _t => {
 	const instance = got.extend({prefixUrl: 'https://example.com', mutableDefaults: true, searchParams: {token: 'abc'}});
-	const searchParameters = (): URLSearchParams => instance.defaults.options.searchParams as URLSearchParams;
+	const searchParameters = (): URLSearchParams => instance.defaults.options.searchParams;
 
 	searchParameters().set('extra', 'yes');
 
@@ -817,7 +817,7 @@ test('extend clones searchParams object', _t => {
 	searchParameters.page = '999';
 
 	// Instance should have the original values (converted to URLSearchParams)
-	const instanceParameters = instance.defaults.options.searchParams as URLSearchParams;
+	const instanceParameters = instance.defaults.options.searchParams;
 	assert.strictEqual(instanceParameters.get('foo'), 'bar');
 	assert.strictEqual(instanceParameters.get('page'), '1');
 });
@@ -831,7 +831,7 @@ test('extend clones URLSearchParams instance', _t => {
 	searchParameters.set('page', '999');
 
 	// Instance should have the original values
-	const instanceParameters = instance.defaults.options.searchParams as URLSearchParams;
+	const instanceParameters = instance.defaults.options.searchParams;
 	assert.strictEqual(instanceParameters.get('foo'), 'bar');
 	assert.strictEqual(instanceParameters.get('page'), '1');
 	assert.notStrictEqual(instanceParameters, searchParameters);
@@ -842,7 +842,7 @@ test('extend handles string searchParams', _t => {
 	const instance = got.extend({searchParams: searchParameters});
 
 	// String gets converted to URLSearchParams
-	const instanceParameters = instance.defaults.options.searchParams as URLSearchParams;
+	const instanceParameters = instance.defaults.options.searchParams;
 	assert.strictEqual(instanceParameters.get('foo'), 'bar');
 	assert.strictEqual(instanceParameters.get('page'), '1');
 });
@@ -856,7 +856,7 @@ test('extended instances carry searchParams', _t => {
 		searchParams: {page: '1'},
 	});
 
-	const instanceParametersB = instanceB.defaults.options.searchParams as URLSearchParams;
+	const instanceParametersB = instanceB.defaults.options.searchParams;
 	assert.strictEqual(instanceParametersB.get('foo'), 'bar');
 	assert.strictEqual(instanceParametersB.get('page'), '1');
 });
@@ -867,10 +867,10 @@ test('extend creates independent searchParams copies', _t => {
 	const instanceB = got.extend({searchParams: searchParameters, mutableDefaults: true});
 
 	// Modify instanceA's searchParams
-	(instanceA.defaults.options.searchParams as URLSearchParams).set('foo', 'modified');
+	instanceA.defaults.options.searchParams.set('foo', 'modified');
 
 	// InstanceB should be unaffected
-	assert.strictEqual((instanceB.defaults.options.searchParams as URLSearchParams).get('foo'), 'bar');
+	assert.strictEqual(instanceB.defaults.options.searchParams.get('foo'), 'bar');
 });
 
 test('got.extend() with responseType works at runtime', withServer, async (_t, server) => {
@@ -931,6 +931,14 @@ for (const mutableDefaults of [true, false]) {
 		assert.strictEqual(Object.isFrozen(instance.defaults.options.headers), !mutableDefaults);
 	});
 }
+
+test('immutable defaults freeze every hook array', _t => {
+	const {hooks} = got.extend({mutableDefaults: false}).defaults.options;
+
+	for (const [event, handlers] of Object.entries(hooks)) {
+		assert.strictEqual(Object.isFrozen(handlers), true, event);
+	}
+});
 
 test('extend retains merged instance mutability through later options', _t => {
 	const mutableInstance = got.extend({mutableDefaults: true});
@@ -1268,4 +1276,153 @@ test('extend rejects non-function handlers', _t => {
 
 test('extend rejects null handlers instead of skipping them', _t => {
 	assert.throws(() => got.extend({handlers: [null as any]}), TypeError);
+});
+
+test('a handler can answer without calling next', withServer, async (_t, server) => {
+	let requestCount = 0;
+	server.get('/', (_request, response) => {
+		requestCount++;
+		response.end('network');
+	});
+
+	const instance = got.extend({
+		prefixUrl: server.url,
+		handlers: [
+			async (options, next) => options.headers['x-cached'] === 'yes' ? 'cached' as never : next(options),
+		],
+	});
+
+	assert.strictEqual(await instance('', {headers: {'x-cached': 'yes'}}), 'cached');
+	assert.strictEqual(requestCount, 0);
+
+	assert.strictEqual((await instance('')).body, 'network');
+	assert.strictEqual(requestCount, 1);
+});
+
+test('an error replaced by a handler is final and comes after the beforeError hooks', withServer, async (_t, server) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 404;
+		response.end();
+	});
+
+	const events: string[] = [];
+	const replacement = new Error('Replaced by the handler');
+	const instance = got.extend({
+		prefixUrl: server.url,
+		retry: {
+			limit: 0,
+		},
+		hooks: {
+			beforeError: [error => {
+				events.push(`beforeError ${error.name}`);
+				return error;
+			}],
+		},
+		handlers: [
+			async (options, next) => {
+				try {
+					return await next(options);
+				} catch (error) {
+					events.push(`handler ${(error as Error).name}`);
+					throw replacement;
+				}
+			},
+		],
+	});
+
+	const error = await rejects(instance(''));
+
+	assert.strictEqual(error, replacement);
+	assert.deepStrictEqual(events, ['beforeError HTTPError', 'handler HTTPError']);
+});
+
+test('an empty hook array in the request options keeps the instance hooks', withServer, async (_t, server) => {
+	server.get('/', (_request, response) => {
+		response.end('ok');
+	});
+
+	let calls = 0;
+	const instance = got.extend({
+		prefixUrl: server.url,
+		hooks: {
+			beforeRequest: [() => {
+				calls++;
+			}],
+		},
+	});
+
+	await instance('', {hooks: {beforeRequest: []}});
+
+	assert.strictEqual(calls, 1);
+	assert.strictEqual(instance.defaults.options.hooks.beforeRequest.length, 1);
+});
+
+test('an afterResponse hook can refresh mutable defaults and retry', withServer, async (_t, server) => {
+	const receivedTokens: Array<string | undefined> = [];
+	server.get('/', (request, response) => {
+		const token = request.headers.token as string | undefined;
+		receivedTokens.push(token);
+		response.statusCode = token === 'fresh' ? 200 : 401;
+		response.end();
+	});
+
+	let refreshCount = 0;
+	const instance = got.extend({
+		prefixUrl: server.url,
+		headers: {
+			token: 'stale',
+		},
+		mutableDefaults: true,
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					if (response.statusCode !== 401) {
+						return response;
+					}
+
+					refreshCount++;
+					const updatedOptions = {headers: {token: 'fresh'}};
+					instance.defaults.options.merge(updatedOptions);
+					return retryWithMergedOptions(updatedOptions);
+				},
+			],
+		},
+	});
+
+	assert.strictEqual((await instance('')).statusCode, 200);
+	assert.strictEqual((await instance('')).statusCode, 200);
+
+	assert.strictEqual(refreshCount, 1);
+	assert.deepStrictEqual(receivedTokens, ['stale', 'fresh', 'fresh']);
+});
+
+test('immutable defaults reject a merge of a scalar option', _t => {
+	const instance = got.extend({maxRedirects: 5});
+
+	assert.throws(() => {
+		instance.defaults.options.merge({maxRedirects: 3});
+	}, TypeError);
+	assert.strictEqual(instance.defaults.options.maxRedirects, 5);
+});
+
+// Suspected bug: merging `maxRedirects` or `hooks` into frozen defaults throws, but `headers` and `timeout` go through `Reflect.set` and are dropped without an error.
+test.failing('immutable defaults reject a merge of headers like other options', _t => {
+	const instance = got.extend({headers: {token: 'original'}});
+
+	assert.throws(() => {
+		instance.defaults.options.merge({headers: {token: 'changed'}});
+	}, TypeError);
+	assert.strictEqual(instance.defaults.options.headers.token, 'original');
+});
+
+// Suspected bug: the dropped merge still marks the header as explicit, which `failed header writes on frozen defaults do not mark headers as explicit` rules out for direct writes.
+test.failing('a header merge dropped by immutable defaults does not mark the header as explicit', _t => {
+	const instance = got.extend({headers: {token: 'original'}});
+
+	try {
+		instance.defaults.options.merge({headers: {authorization: 'Bearer secret'}});
+	} catch {}
+
+	assert.strictEqual(instance.defaults.options.headers.authorization, undefined);
+	assert.strictEqual(instance.defaults.options.isHeaderExplicitlySet('authorization'), false);
 });

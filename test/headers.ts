@@ -2,6 +2,7 @@ import process from 'node:process';
 import {Buffer} from 'node:buffer';
 import fs from 'node:fs';
 import path from 'node:path';
+import {gzipSync} from 'node:zlib';
 import type {TestContext} from 'node:test';
 import assert from 'node:assert/strict';
 import type {Handler} from 'express';
@@ -233,8 +234,11 @@ test('drops `content-length` when `transfer-encoding` is set manually', async t 
 	const {port, close} = await createRawHttpServer(socket => {
 		socket.setEncoding('latin1');
 
+		// Under load the body can arrive in several segments, so a data event can fire after the response was already written.
 		const respond = () => {
-			socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');
+			if (!socket.writableEnded) {
+				socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');
+			}
 		};
 
 		socket.on('data', chunk => {
@@ -388,7 +392,8 @@ test('single-element `authorization` header arrays override URL credentials', as
 		socket.on('data', chunk => {
 			rawRequest += String(chunk);
 
-			if (rawRequest.includes('\r\n\r\n')) {
+			// Under load the headers and body can arrive in separate segments, so this runs twice.
+			if (!socket.writableEnded && rawRequest.includes('\r\n\r\n')) {
 				socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');
 			}
 		});
@@ -420,7 +425,8 @@ test('accepts a single-element `transfer-encoding` header array', async t => {
 		socket.on('data', chunk => {
 			rawRequest += String(chunk);
 
-			if (rawRequest.includes('\r\n\r\n')) {
+			// Under load the headers and body can arrive in separate segments, so this runs twice.
+			if (!socket.writableEnded && rawRequest.includes('\r\n\r\n')) {
 				socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');
 			}
 		});
@@ -454,7 +460,8 @@ test('accepts a string `transfer-encoding` header with multiple codings', async 
 		socket.on('data', chunk => {
 			rawRequest += String(chunk);
 
-			if (rawRequest.includes('\r\n\r\n')) {
+			// Under load the headers and body can arrive in separate segments, so this runs twice.
+			if (!socket.writableEnded && rawRequest.includes('\r\n\r\n')) {
 				socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');
 			}
 		});
@@ -691,4 +698,72 @@ test('rejects duplicate `host` headers', duplicateHeaderRejectionMacro, {
 			host: ['one.example.com', 'two.example.com'],
 		},
 	}),
+});
+
+test('a username containing a colon round-trips into the Basic credentials', withServer, async (_t, server, got) => {
+	server.get('/', (request, response) => {
+		response.end(request.headers.authorization ?? 'none');
+	});
+
+	// The URL stores the credentials percent-encoded; the Basic header is built from the decoded values, colons included.
+	const {body} = await got('', {username: 'user:colon', password: 'p@ss'});
+	assert.strictEqual(body, `Basic ${Buffer.from('user:colon:p@ss').toString('base64')}`);
+});
+
+test('number header values are stored and sent as strings', withServer, async (_t, server, got) => {
+	server.get('/', (request, response) => {
+		response.json({fromOption: request.headers['x-option'], fromHook: request.headers['x-hook']});
+	});
+
+	const readInHook: unknown[] = [];
+	const body = await got('', {
+		headers: {'x-option': 1},
+		hooks: {
+			beforeRequest: [
+				options => {
+					// A JavaScript caller can assign a number, which the `Headers` type does not allow.
+					(options.headers as Record<string, unknown>)['x-hook'] = 2;
+					readInHook.push(options.headers['x-option'], options.headers['x-hook']);
+				},
+			],
+		},
+	}).json();
+
+	assert.deepStrictEqual(readInHook, ['1', '2']);
+	assert.deepStrictEqual(body, {fromOption: '1', fromHook: '2'});
+});
+
+test('`responseType: json` sets `accept` without overriding an explicit one', withServer, async (_t, server, got) => {
+	server.get('/', echoHeaders);
+
+	const defaultHeaders = (await got<Headers>({responseType: 'json'})).body;
+	assert.strictEqual(defaultHeaders.accept, 'application/json');
+
+	const explicitHeaders = (await got<Headers>({
+		responseType: 'json',
+		headers: {accept: 'application/vnd.api+json'},
+	})).body;
+	assert.strictEqual(explicitHeaders.accept, 'application/vnd.api+json');
+});
+
+test('the `json` option alone does not set `accept`', withServer, async (_t, server, got) => {
+	server.post('/', echoHeaders);
+
+	const headers = JSON.parse((await got.post({json: {a: 1}})).body) as Headers;
+
+	assert.strictEqual(headers.accept, undefined);
+	assert.strictEqual(headers['content-type'], 'application/json');
+});
+
+test('a gzip response is decompressed even when `accept-encoding` is overridden', withServer, async (_t, server, got) => {
+	server.get('/', (request, response) => {
+		response.setHeader('x-accept-encoding', request.headers['accept-encoding'] ?? '');
+		response.setHeader('content-encoding', 'gzip');
+		response.end(gzipSync('decoded'));
+	});
+
+	const response = await got({headers: {'accept-encoding': 'identity'}});
+
+	assert.strictEqual(response.headers['x-accept-encoding'], 'identity');
+	assert.strictEqual(response.body, 'decoded');
 });
